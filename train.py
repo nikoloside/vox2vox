@@ -23,6 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch
 
+from torch.utils.tensorboard import SummaryWriter 
+
 import h5py
 
 def train():
@@ -54,6 +56,8 @@ def train():
 
     os.makedirs("images/%s" % opt.dataset_name, exist_ok=True)
     os.makedirs("saved_models/%s" % opt.dataset_name, exist_ok=True)
+    os.makedirs("tensorboard/%s" % opt.dataset_name, exist_ok=True)
+    summaryWriter = SummaryWriter(log_dir="tensorboard/%s/logs" % opt.dataset_name)
 
     cuda = True if torch.cuda.is_available() else False
 
@@ -145,6 +149,13 @@ def train():
     prev_time = time.time()
     discriminator_update = 'False'
     for epoch in range(opt.epoch, opt.n_epochs):
+        total_loss_dis = 0
+        total_loss_gen = 0
+        total_acc_real = 0
+        total_acc_fake = 0
+        total_acc_total = 0
+        total_loss_voxel = 0
+        total_loss_GAN = 0
         for i, batch in enumerate(dataloader):
 
             # Model inputs
@@ -214,7 +225,8 @@ def train():
             # Print log
             sys.stdout.write(
                 "\r[Epoch %d/%d] [Batch %d/%d] [D loss: %f, D accuracy: %f, D update: %s] [G loss: %f, voxel: %f, adv: %f] ETA: %s"
-                % (
+                % (oss": avg_loss_GAN}, epoch)
+
                     epoch,
                     opt.n_epochs,
                     i,
@@ -228,12 +240,34 @@ def train():
                     time_left,
                 )
             )
+            
+            # PyTorch TensorBoard Cal Total
+            total_loss_dis += loss_D.item()
+            total_loss_gen += loss_G.item()
+            total_acc_real += d_real_acu
+            total_acc_fake += d_fake_acu
+            total_acc_total += d_total_acu
+            total_loss_voxel += loss_voxel.item()
+            total_loss_GAN += loss_GAN.item()
+
             # If at sample interval save image
             if batches_done % (opt.sample_interval*len(dataloader)) == 0:
                 sample_voxel_volumes(epoch)
                 print('*****volumes sampled*****')
 
             discriminator_update = 'False'
+
+        # PyTorch Tensorboard Write Log
+        avg_loss_dis = total_loss_dis / len(dataloader)
+        avg_loss_gen = total_loss_gen / len(dataloader)
+        avg_acc_real = total_acc_real / len(dataloader)
+        avg_acc_fake = total_acc_fake / len(dataloader)
+        avg_acc_total = total_acc_total / len(dataloader)
+        avg_loss_voxel = total_loss_voxel / len(dataloader)
+        avg_loss_GAN = total_loss_GAN / len(dataloader)
+        summaryWriter.add_scalars("Discriminator", {"D_loss": avg_loss_dis, "G_loss": avg_loss_gen}, epoch)
+        summaryWriter.add_scalar("Real vs Fake", {"real_acc": avg_acc_real, "fake_acc": avg_acc_fake, "total_acc": avg_acc_total}, epoch)
+        summaryWriter.add_scalar("Total Loss vs Voxel-wise vs GAN Loss", {"Total_loss": avg_loss_gen, "Voxel_loss": avg_loss_voxel, "GAN_loss": avg_loss_GAN}, epoch)
 
         if opt.checkpoint_interval != -1 and epoch % opt.checkpoint_interval == 0:
             # Save model checkpoints
