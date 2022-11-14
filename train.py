@@ -23,6 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch
 
+from torch.utils.tensorboard import SummaryWriter 
+
 import h5py
 
 def train():
@@ -54,15 +56,17 @@ def train():
 
     os.makedirs("images/%s" % opt.dataset_name, exist_ok=True)
     os.makedirs("saved_models/%s" % opt.dataset_name, exist_ok=True)
+    os.makedirs("tensorboard/%s" % opt.dataset_name, exist_ok=True)
+    summaryWriter = SummaryWriter(log_dir="tensorboard/%s/logs" % opt.dataset_name)
 
     cuda = True if torch.cuda.is_available() else False
 
     # Loss functions
     criterion_GAN = torch.nn.MSELoss()
-    criterion_voxelwise = diceloss()
+    criterion_voxelwise = torch.nn.L1Loss()
 
     # Loss weight of L1 voxel-wise loss between translated image and real image
-    lambda_voxel = 100
+    lambda_voxel = 0.1
 
     # Calculate output of image discriminator (PatchGAN)
     patch = (1, opt.img_height // 2 ** 4, opt.img_width // 2 ** 4, opt.img_depth // 2 ** 4)
@@ -80,7 +84,8 @@ def train():
     if opt.epoch != 0:
         # Load pretrained models
         generator.load_state_dict(torch.load("saved_models/%s/generator_%d.pth" % (opt.dataset_name, opt.epoch)))
-        discriminator.load_state_dict(torch.load("saved_models/%s/discriminator_%d.pth" % (opt.dataset_name, opt.epoch)))
+        discriminator.load_state_dict(
+            torch.load("saved_models/%s/discriminator_%d.pth" % (opt.dataset_name, opt.epoch)))
     else:
         # Initialize weights
         generator.apply(weights_init_normal)
@@ -145,6 +150,12 @@ def train():
     prev_time = time.time()
     discriminator_update = 'False'
     for epoch in range(opt.epoch, opt.n_epochs):
+        total_loss_dis = 0
+        total_acc_dx = 0
+        total_acc_dgz1 = 0
+        total_acc_dgz2 = 0
+        total_loss_voxel = 0
+        total_loss_cGAN = 0
         for i, batch in enumerate(dataloader):
 
             # Model inputs
@@ -157,46 +168,73 @@ def train():
 
 
             # ---------------------
-            #  Train Discriminator, only update every disc_update batches
+            #  Train Discriminator
             # ---------------------
+            # max_D first
+            for p in discriminator.parameters():
+                p.requires_grad = True
+            discriminator.zero_grad()
+
             # Real loss
             fake_B = generator(real_A)
             pred_real = discriminator(real_B, real_A)
             loss_real = criterion_GAN(pred_real, valid)
+            loss_real.backward()
 
             # Fake loss
             pred_fake = discriminator(fake_B.detach(), real_A)
             loss_fake = criterion_GAN(pred_fake, fake)
+            loss_fake.backward()
+
             # Total loss
-            loss_D = 0.5 * (loss_real + loss_fake)
+            # loss_D = 0.5 * (loss_real + loss_fake)
+            loss_D = loss_real + loss_fake
 
-            d_real_acu = torch.ge(pred_real.squeeze(), 0.5).float()
-            d_fake_acu = torch.le(pred_fake.squeeze(), 0.5).float()
-            d_total_acu = torch.mean(torch.cat((d_real_acu, d_fake_acu), 0))
+            # D_x
+            # d_real_acu = torch.ge(pred_real.squeeze(), 0.5).float()
+            D_x = pred_real.data.mean()
 
-            if d_total_acu <= opt.d_threshold:
-                optimizer_D.zero_grad()
-                loss_D.backward()
-                optimizer_D.step()
-                discriminator_update = 'True'
+            # D_G_z1
+            # d_fake_acu = torch.le(pred_fake.squeeze(), 0.5).float()
+            D_G_z1 = pred_fake.data.mean()
+
+            # d_total_acu = torch.mean(torch.cat((d_real_acu, d_fake_acu), 0))
+
+
+            # if d_total_acu <= opt.d_threshold:
+            #     optimizer_D.zero_grad()
+            #     loss_D.backward()
+            #     discriminator_update = 'True'
+            optimizer_D.step()
 
             # ------------------
             #  Train Generators
             # ------------------
-            optimizer_D.zero_grad()
-            optimizer_G.zero_grad()
+            # optimizer_D.zero_grad()
+            # optimizer_G.zero_grad()
 
-            # GAN loss
-            fake_B = generator(real_A)
-            pred_fake = discriminator(fake_B, real_A)
-            loss_GAN = criterion_GAN(pred_fake, valid)
+            # prevent computing gradients of weights in Discriminator
+            for p in discriminator.parameters():
+                p.requires_grad = False
+            generator.zero_grad()
+
             # Voxel-wise loss
             loss_voxel = criterion_voxelwise(fake_B, real_B)
+            loss_V = lambda_voxel * loss_voxel
+            if lambda_voxel != 0:
+                loss_V.backward(retain_graph=True)
+
+            # GAN loss
+            # fake_B = generator(real_A)
+            pred_fake = discriminator(fake_B, real_A)
+            loss_cGAN = criterion_GAN(pred_fake, valid)
+            loss_cGAN.backward()
+            D_G_z2 = pred_fake.data.mean() # D_G_z2
 
             # Total loss
-            loss_G = loss_GAN + lambda_voxel * loss_voxel
-
-            loss_G.backward()
+            # loss_G = loss_GAN + lambda_voxel * loss_voxel
+            #
+            # loss_G.backward()
 
             optimizer_G.step()
 
@@ -213,27 +251,53 @@ def train():
 
             # Print log
             sys.stdout.write(
-                "\r[Epoch %d/%d] [Batch %d/%d] [D loss: %f, D accuracy: %f, D update: %s] [G loss: %f, voxel: %f, adv: %f] ETA: %s"
+                "\r[Epoch %d/%d] [Batch %d/%d] [D x: %f, D G z1: %f, D G z2: %f] [d: %f, voxel: %f, cGAN: %f] ETA: %s"
                 % (
+
                     epoch,
                     opt.n_epochs,
                     i,
                     len(dataloader),
+                    D_x,
+                    D_G_z1,
+                    D_G_z2,
                     loss_D.item(),
-                    d_total_acu,
-                    discriminator_update,
-                    loss_G.item(),
                     loss_voxel.item(),
-                    loss_GAN.item(),
+                    loss_cGAN.item(),
                     time_left,
                 )
             )
+            summaryWriter.add_scalars("Loss Func",
+                                        {"D_loss": loss_D.item(), "V_loss": loss_voxel.item(), "cGAN_loss": loss_cGAN.item()}, 100*(epoch + i / float(len(dataloader))))
+            summaryWriter.add_scalars("Difference",
+                                        {"dx": D_x, "dgz1": D_G_z1, "dgz2": D_G_z2}, 100*(epoch + i / float(len(dataloader))))
+            
+            # PyTorch TensorBoard Cal Total
+            total_loss_dis += loss_D.item()
+            total_acc_dx += D_x
+            total_acc_dgz1 += D_G_z1
+            total_acc_dgz2 += D_G_z2
+            total_loss_voxel += loss_voxel.item()
+            total_loss_cGAN += loss_cGAN.item()
+
             # If at sample interval save image
-            if batches_done % (opt.sample_interval*len(dataloader)) == 0:
+            if batches_done % (opt.sample_interval * len(dataloader)) == 0:
                 sample_voxel_volumes(epoch)
                 print('*****volumes sampled*****')
 
             discriminator_update = 'False'
+
+        # PyTorch Tensorboard Write Log
+        avg_loss_dis = total_loss_dis / len(dataloader)
+        avg_acc_dx = total_acc_dx / len(dataloader)
+        avg_acc_dgz1 = total_acc_dgz1 / len(dataloader)
+        avg_acc_dgz2 = total_acc_dgz2 / len(dataloader)
+        avg_loss_voxel = total_loss_voxel / len(dataloader)
+        avg_loss_cGAN = total_loss_cGAN / len(dataloader)
+        summaryWriter.add_scalars("Loss Func Avg",
+                                    {"D_loss": avg_loss_dis, "V_loss": avg_loss_voxel, "cGAN_loss": avg_loss_cGAN}, epoch)
+        summaryWriter.add_scalars("Difference Avg",
+                                    {"dx": avg_acc_dx, "dgz1": avg_acc_dgz1, "dgz2": avg_acc_dgz2}, epoch)
 
         if opt.checkpoint_interval != -1 and epoch % opt.checkpoint_interval == 0:
             # Save model checkpoints
@@ -246,3 +310,4 @@ if __name__ == '__main__':
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     train()
+
